@@ -34,23 +34,27 @@ Upstream targeted an older plugin SDK. This fork:
 
 ## Install
 
-### Option A — local dev path (recommended, works with the dangerous-code scanner)
+### Option A — plugin root (recommended, works with the dangerous-code scanner)
 
 The plugin shells out to `git`, so `openclaw plugins install` flags it as "dangerous code"
-and blocks the install. Load it as a local development path instead:
+and blocks the install. Install it into the shared plugin root instead — this makes the
+plugin (and its skills cache) available to **every agent** on the machine:
 
 ```bash
+mkdir -p ~/.openclaw/extensions
 git clone https://github.com/giotdang/openclaw-superpowers-bridge.git \
-  ~/.openclaw/workspace/projects/superpowers-bridge
-npm --prefix ~/.openclaw/workspace/projects/superpowers-bridge run build   # optional: rebuild dist
+  ~/.openclaw/extensions/superpowers-bridge
+npm --prefix ~/.openclaw/extensions/superpowers-bridge run build   # optional: rebuild dist (dist is committed)
 ```
 
-Then add to `~/.openclaw/openclaw.json`:
+Then in `~/.openclaw/openclaw.json`: enable the plugin, and let each agent opt in to the
+plugin-owned tools. **Important:** plugin-owned tools are only exposed when the agent's tool
+policy uses `profile` + `alsoAllow`; listing them in `tools.allow` alone does *not* expose them
+(and `allow` + `alsoAllow` in the same scope is rejected by config validation).
 
 ```json
 {
   "plugins": {
-    "load": { "paths": ["~/.openclaw/workspace/projects/superpowers-bridge"] },
     "entries": {
       "superpowers-bridge": {
         "enabled": true,
@@ -61,6 +65,17 @@ Then add to `~/.openclaw/openclaw.json`:
         }
       }
     }
+  },
+  "agents": {
+    "list": [
+      {
+        "id": "main",
+        "tools": {
+          "profile": "coding",
+          "alsoAllow": ["superpowers_skill", "update_superpowers_skills", "superpowers_version"]
+        }
+      }
+    ]
   }
 }
 ```
@@ -69,6 +84,9 @@ Then add to `~/.openclaw/openclaw.json`:
 openclaw config validate
 openclaw gateway restart   # or: systemctl restart openclaw-gateway
 ```
+
+Repeat the `tools` block for each agent that should be able to load skills manually.
+Prompt injection (auto-select) works for every agent regardless of the tool policy.
 
 ### Option B — package install
 
@@ -107,6 +125,25 @@ openclaw plugins inspect superpowers-bridge --runtime --json
 ```
 
 Expected: `"status": "loaded"`, the three tools above, and `hookCount: 1`.
+
+To confirm an agent actually *receives* the tools, run a throwaway turn and inspect the
+compiled context (OpenClaw records it under `agents/<id>/sessions/<id>.trajectory.jsonl`
+as a `context.compiled` record):
+
+```bash
+openclaw agent --agent zeus --session-id spcheck --message "Reply exactly: OK"
+```
+
+## Gotchas learned the hard way
+
+- `openclaw plugins install` blocks the plugin (shell exec via `git`). Install into
+  `~/.openclaw/extensions/` instead — no scanner, no `--dangerously-force-unsafe-install` needed.
+- `tools.allow: ["<tool-name>"]` does **not** reveal plugin-owned tools. Use
+  `tools.profile` + `tools.alsoAllow`. Setting both `allow` and `alsoAllow` in the same
+  scope fails config validation.
+- `openclaw gateway restart` (or `systemctl restart openclaw-gateway`) kills any `exec`
+  shell running under the gateway — run the restart detached (`setsid ... &`) if you need
+  the calling shell to survive.
 
 ## Attribution & license
 
