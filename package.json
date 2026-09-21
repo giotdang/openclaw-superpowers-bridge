@@ -1,26 +1,30 @@
 {
-  "name": "@vruru/superpowers-bridge",
-  "version": "2.1.0",
-  "description": "Bridge to Superpowers workflow skills for OpenClaw - auto-fetches from GitHub",
+  "name": "@giotdang/openclaw-superpowers-bridge",
+  "version": "2.2.0",
+  "description": "Bridge to Superpowers workflow skills for OpenClaw - auto-fetches from GitHub and injects relevant skills",
   "type": "module",
   "main": "index.ts",
   "keywords": ["openclaw", "superpowers", "skills", "workflow"],
-  "author": "vruru",
+  "author": "vruru (original), OpenClaw-hardened fork",
   "license": "MIT",
   "openclaw": {
-    "extensions": ["./index.ts"]
+    "extensions": ["./index.ts"],
+    "runtimeExtensions": ["./dist/index.js"]
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/vruru/superpowers-bridge"
+    "url": "https://github.com/giotdang/openclaw-superpowers-bridge"
   },
   "publishConfig": {
     "access": "public"
   },
   "files": [
     "index.ts",
+    "dist/index.js",
     "openclaw.plugin.json",
-    "README.md",
-    "src/"
-  ]
+    "README.md"
+  ],
+  "scripts": {
+    "build": "npx --yes -p typescript@5 tsc index.ts --outDir dist --target ES2022 --module esnext --moduleResolution bundler --skipLibCheck"
+  }
 }

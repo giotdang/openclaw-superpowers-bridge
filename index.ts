@@ -1,21 +1,46 @@
 /**
  * Superpowers Bridge Plugin for OpenClaw
- * 
- * Automatically fetches and manages Superpowers skills from GitHub.
+ *
+ * Automatically fetches and manages Superpowers workflow skills from GitHub
+ * and injects the relevant ones into the agent prompt.
+ *
  * Based on https://github.com/obra/superpowers
+ * Originally by vruru (https://github.com/vruru/superpowers-bridge), MIT.
+ *
+ * OpenClaw-hardened fork:
+ *  - Uses the non-deprecated `before_prompt_build` hook (was `before_agent_start`)
+ *  - Correct agent-tool shape (label + execute(toolCallId, params)) for the
+ *    current plugin SDK
+ *  - Vietnamese + English keyword detection (word-boundary aware for ASCII)
+ *  - Cost control: `injectionMode` (summary|full), `maxInjectedChars`,
+ *    `injectOncePerSession`
+ *  - Manifest declares `contracts.tools` + `activation.onStartup` so the tools
+ *    are discoverable before runtime load
+ *
+ * No external runtime dependencies (only Node built-ins), so it loads without
+ * an npm install step.
  */
 
-import type { OpenClawPluginApi, Tool } from "openclaw/plugin-sdk";
 import * as fs from "fs";
 import * as path from "path";
 import { execSync } from "child_process";
+import { fileURLToPath } from "url";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 interface PluginConfig {
   enabled?: boolean;
   skillsRepo?: string;
-  docsPath?: string;
   autoDetectCode?: boolean;
   autoUpdate?: boolean;
+  injectionMode?: "summary" | "full";
+  maxInjectedChars?: number;
+  injectOncePerSession?: boolean;
+  defaultSkill?: string;
+  autoSelectSkills?: string[];
+  extraKeywords?: Record<string, string[]>;
 }
 
 interface Skill {
@@ -24,63 +49,104 @@ interface Skill {
   content: string;
 }
 
+interface Logger {
+  info: (...args: unknown[]) => void;
+  warn: (...args: unknown[]) => void;
+  error: (...args: unknown[]) => void;
+  debug?: (...args: unknown[]) => void;
+}
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
 const DEFAULT_SKILLS_REPO = "https://github.com/obra/superpowers.git";
 const SKILLS_SUBDIR = "skills";
 const CACHE_DIR_NAME = ".superpowers-cache";
 
-// Keywords that indicate a code/development task
-const CODE_KEYWORDS: Record<string, string[]> = {
-  "brainstorming": ["写代码", "编写", "实现", "开发", "创建", "构建", "功能", "feature",
-    "write code", "implement", "develop", "create", "build", "function", "class", "script", "program", "app"],
-  "writing-plans": ["计划", "规划", "方案", "plan", "spec", "设计", "design"],
-  "subagent-driven-development": ["执行", "implement", "execute", "task"],
-  "test-driven-development": ["测试", "test", "TDD", "unittest", "jest", "mocha"],
-  "systematic-debugging": ["调试", "debug", "修复", "fix", "bug", "错误", "error", "issue"],
-  "using-git-worktrees": ["分支", "branch", "worktree", "git"],
-  "finishing-a-development-branch": ["完成", "结束", "合并", "merge", "PR", "pull request"],
+/**
+ * Keyword map: skill name -> trigger keywords.
+ * ASCII keywords are matched on word boundaries; non-ASCII (Vietnamese etc.)
+ * are matched with plain substring matching.
+ */
+const DEFAULT_KEYWORDS: Record<string, string[]> = {
+  brainstorming: [
+    "写代码", "编写", "实现", "开发", "创建", "构建", "功能",
+    "write code", "implement", "develop", "create", "build", "function", "class",
+    "script", "program", "app", "feature",
+    // Vietnamese
+    "viết code", "viết hàm", "viết chương trình", "viết script", "lập trình",
+    "xây dựng", "phát triển", "tính năng", "chức năng", "ý tưởng", "bàn bạc",
+    "triển khai", "tạo mới", "làm cái", "làm cái gì",
+  ],
+  "writing-plans": [
+    "计划", "规划", "方案", "plan", "spec", "设计", "design",
+    // Vietnamese
+    "kế hoạch", "lập kế hoạch", "lên kế hoạch", "phương án", "lộ trình",
+    "thiết kế", "đặc tả",
+  ],
+  "subagent-driven-development": [
+    "执行", "implement", "execute", "task",
+    // Vietnamese
+    "tác vụ", "subagent", "chia việc",
+  ],
+  "test-driven-development": [
+    "测试", "test", "tdd", "unittest", "jest", "mocha",
+    // Vietnamese
+    "kiểm thử", "viết test", "unit test", "kiểm thử tự động",
+  ],
+  "systematic-debugging": [
+    "调试", "debug", "修复", "fix", "bug", "错误", "error", "issue",
+    // Vietnamese
+    "sửa lỗi", "gỡ lỗi", "tìm lỗi", "bị lỗi", "báo lỗi", "không chạy",
+    "crash", "lỗi",
+  ],
+  "using-git-worktrees": [
+    "分支", "branch", "worktree", "git",
+    // Vietnamese
+    "nhánh",
+  ],
+  "finishing-a-development-branch": [
+    "完成", "结束", "合并", "merge", "pr", "pull request",
+    // Vietnamese
+    "hợp nhất", "tạo pr", "gộp nhánh",
+  ],
 };
 
 const ALWAYS_LOAD_SKILLS = ["using-superpowers"];
 
-/**
- * Get the cache directory path (inside plugin directory)
- */
+// ---------------------------------------------------------------------------
+// Cache / git helpers
+// ---------------------------------------------------------------------------
+
 function getCacheDir(): string {
-  // Plugin directory is where this file is located
-  const pluginDir = path.dirname(new URL(import.meta.url).pathname);
+  const pluginDir = path.dirname(fileURLToPath(import.meta.url));
   return path.join(pluginDir, CACHE_DIR_NAME);
 }
 
-/**
- * Get the skills directory path inside cache
- */
 function getSkillsDir(cacheDir: string): string {
   return path.join(cacheDir, SKILLS_SUBDIR);
 }
 
-/**
- * Ensure skills are available (clone if needed)
- */
-function ensureSkills(repoUrl: string, logger: any): { success: boolean; skillsDir: string; message: string } {
+function ensureSkills(
+  repoUrl: string,
+  logger: Logger,
+): { success: boolean; skillsDir: string; message: string } {
   const cacheDir = getCacheDir();
   const skillsDir = getSkillsDir(cacheDir);
 
-  // Check if already cloned
   if (fs.existsSync(path.join(cacheDir, ".git"))) {
     return { success: true, skillsDir, message: "Skills already cached" };
   }
 
-  // Need to clone
   logger.info(`[Superpowers Bridge] First run - cloning skills from ${repoUrl}...`);
-  
+
   try {
-    // Create cache directory parent if needed
     const parentDir = path.dirname(cacheDir);
     if (!fs.existsSync(parentDir)) {
       fs.mkdirSync(parentDir, { recursive: true });
     }
 
-    // Clone the repo
     execSync(`git clone --depth 1 "${repoUrl}" "${cacheDir}"`, {
       stdio: "pipe",
       timeout: 60000,
@@ -88,17 +154,14 @@ function ensureSkills(repoUrl: string, logger: any): { success: boolean; skillsD
 
     logger.info(`[Superpowers Bridge] Successfully cloned skills to ${cacheDir}`);
     return { success: true, skillsDir, message: "Skills cloned successfully" };
-  } catch (err: any) {
-    const message = err.message || String(err);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
     logger.error(`[Superpowers Bridge] Failed to clone skills: ${message}`);
     return { success: false, skillsDir, message: `Clone failed: ${message}` };
   }
 }
 
-/**
- * Update skills (git pull)
- */
-function updateSkills(logger: any): { success: boolean; message: string } {
+function updateSkills(logger: Logger): { success: boolean; message: string } {
   const cacheDir = getCacheDir();
 
   if (!fs.existsSync(path.join(cacheDir, ".git"))) {
@@ -107,26 +170,22 @@ function updateSkills(logger: any): { success: boolean; message: string } {
 
   try {
     logger.info("[Superpowers Bridge] Updating skills...");
-    const output = execSync("git pull", {
+    const output = execSync("git pull --ff-only", {
       cwd: cacheDir,
       stdio: "pipe",
       encoding: "utf-8",
       timeout: 30000,
     });
-    
-    logger.info(`[Superpowers Bridge] Skills updated: ${output.trim()}`);
-    return { success: true, message: output.trim() || "Already up to date" };
-  } catch (err: any) {
-    const message = err.message || String(err);
+    logger.info(`[Superpowers Bridge] Skills updated: ${String(output).trim()}`);
+    return { success: true, message: String(output).trim() || "Already up to date" };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
     logger.error(`[Superpowers Bridge] Failed to update skills: ${message}`);
     return { success: false, message: `Update failed: ${message}` };
   }
 }
 
-/**
- * Get current skills version info
- */
-function getSkillsVersion(logger: any): { success: boolean; version: string; message: string } {
+function getSkillsVersion(logger: Logger): { success: boolean; version: string; message: string } {
   const cacheDir = getCacheDir();
 
   if (!fs.existsSync(path.join(cacheDir, ".git"))) {
@@ -139,55 +198,52 @@ function getSkillsVersion(logger: any): { success: boolean; version: string; mes
       stdio: "pipe",
       encoding: "utf-8",
     }).trim();
-    
+
     const date = execSync("git log -1 --format=%cd", {
       cwd: cacheDir,
       stdio: "pipe",
       encoding: "utf-8",
     }).trim();
 
-    return { 
-      success: true, 
-      version: commit, 
-      message: `Skills version: ${commit} (${date})` 
-    };
-  } catch (err: any) {
-    return { success: false, version: "", message: `Failed to get version: ${err.message}` };
+    return { success: true, version: commit, message: `Skills version: ${commit} (${date})` };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { success: false, version: "", message: `Failed to get version: ${message}` };
   }
 }
 
-/**
- * Parse frontmatter from skill markdown content
- */
-function parseSkill(content: string, filename: string): Skill | null {
-  const match = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+// ---------------------------------------------------------------------------
+// Skill parsing
+// ---------------------------------------------------------------------------
+
+function parseSkill(content: string, filename: string, logger: Logger): Skill | null {
+  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
   if (!match) {
-    console.warn(`[Superpowers Bridge] No frontmatter found in ${filename}`);
+    logger.warn(`[Superpowers Bridge] No frontmatter found in ${filename}`);
     return null;
   }
 
   const frontmatterStr = match[1];
   const body = match[2].trim();
 
-  const nameMatch = frontmatterStr.match(/name:\s*(.+)/);
-  const descMatch = frontmatterStr.match(/description:\s*(.+)/);
+  const nameMatch = frontmatterStr.match(/^name:\s*(.+)$/m);
+  const descMatch = frontmatterStr.match(/^description:\s*([\s\S]*?)(?:\n\w|\s*$)/m);
 
   if (!nameMatch) {
-    console.warn(`[Superpowers Bridge] No name in frontmatter of ${filename}`);
+    logger.warn(`[Superpowers Bridge] No name in frontmatter of ${filename}`);
     return null;
   }
 
+  const clean = (s: string) => s.trim().replace(/^["']|["']$/g, "").replace(/\s+/g, " ");
+
   return {
-    name: nameMatch[1].trim().replace(/^["']|["']$/g, ""),
-    description: descMatch ? descMatch[1].trim().replace(/^["']|["']$/g, "") : "",
+    name: clean(nameMatch[1]),
+    description: descMatch ? clean(descMatch[1]) : "",
     content: body,
   };
 }
 
-/**
- * Load all skills from the skills directory
- */
-function loadSkills(skillsDir: string, logger: any): Map<string, Skill> {
+function loadSkills(skillsDir: string, logger: Logger): Map<string, Skill> {
   const skills = new Map<string, Skill>();
 
   if (!fs.existsSync(skillsDir)) {
@@ -205,12 +261,12 @@ function loadSkills(skillsDir: string, logger: any): Map<string, Skill> {
 
     try {
       const content = fs.readFileSync(skillPath, "utf-8");
-      const skill = parseSkill(content, entry.name);
+      const skill = parseSkill(content, entry.name, logger);
       if (skill) {
         skills.set(skill.name, skill);
-        logger.debug(`[Superpowers Bridge] Loaded skill: ${skill.name}`);
+        logger.debug?.(`[Superpowers Bridge] Loaded skill: ${skill.name}`);
       }
-    } catch (err) {
+    } catch (err: unknown) {
       logger.error(`[Superpowers Bridge] Failed to load ${skillPath}:`, err);
     }
   }
@@ -218,209 +274,286 @@ function loadSkills(skillsDir: string, logger: any): Map<string, Skill> {
   return skills;
 }
 
-/**
- * Detect which skills are relevant to the user's prompt
- */
-function detectRelevantSkills(prompt: string, skills: Map<string, Skill>): string[] {
+// ---------------------------------------------------------------------------
+// Detection
+// ---------------------------------------------------------------------------
+
+const ASCII_KEYWORD = /^[a-z0-9][a-z0-9 _-]*$/i;
+
+function matchesKeyword(haystackLower: string, keyword: string): boolean {
+  const kw = keyword.toLowerCase().trim();
+  if (!kw) return false;
+
+  if (ASCII_KEYWORD.test(kw)) {
+    // Word-boundary match to avoid false positives like "app" in "application".
+    const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`(?:^|[^a-z0-9])${escaped}(?:[^a-z0-9]|$)`, "i");
+    return re.test(haystackLower);
+  }
+
+  // Non-ASCII (Vietnamese, CJK): substring match.
+  return haystackLower.includes(kw);
+}
+
+function detectRelevantSkills(
+  prompt: string,
+  skills: Map<string, Skill>,
+  keywords: Record<string, string[]>,
+  whitelist: string[] | undefined,
+  defaultSkill: string,
+): string[] {
   const promptLower = prompt.toLowerCase();
   const relevant = new Set<string>();
 
-  // Always include using-superpowers
-  for (const skillName of ALWAYS_LOAD_SKILLS) {
-    if (skills.has(skillName)) {
-      relevant.add(skillName);
-    }
+  // Bootstrap skill (if present). Honors a custom default.
+  for (const name of new Set([defaultSkill, ...ALWAYS_LOAD_SKILLS])) {
+    if (name && skills.has(name)) relevant.add(name);
   }
 
-  // Detect by keywords
-  for (const [skillName, keywords] of Object.entries(CODE_KEYWORDS)) {
-    if (keywords.some(kw => promptLower.includes(kw.toLowerCase()))) {
-      if (skills.has(skillName)) {
-        relevant.add(skillName);
-      }
+  for (const [skillName, kws] of Object.entries(keywords)) {
+    if (whitelist && whitelist.length > 0 && !whitelist.includes(skillName)) continue;
+    if (!skills.has(skillName)) continue;
+    if (kws.some((kw) => matchesKeyword(promptLower, kw))) {
+      relevant.add(skillName);
     }
   }
 
   return Array.from(relevant);
 }
 
-/**
- * Build system context from skills
- */
-function buildSkillsContext(skills: Map<string, Skill>, skillNames: string[]): string {
+// ---------------------------------------------------------------------------
+// Prompt assembly
+// ---------------------------------------------------------------------------
+
+const TOOL_MAPPING = [
+  "## Tool Mapping (Superpowers -> OpenClaw)",
+  "",
+  "- TodoWrite -> track tasks via notes",
+  "- Task / subagent dispatch -> `sessions_spawn` with runtime \"subagent\"",
+  "- Bash -> `exec` tool",
+  "- Read -> `read` tool",
+  "- Edit -> `edit` tool",
+  "- Write -> `write` tool",
+  "- Skill -> `superpowers_skill` tool (provided by this plugin)",
+  "",
+  "**Remember**: follow the loaded skills exactly. They are mandatory workflows, not suggestions.",
+].join("\n");
+
+function buildSkillsContext(
+  skills: Map<string, Skill>,
+  skillNames: string[],
+  mode: "summary" | "full",
+  maxChars: number,
+): string {
   const sections: string[] = [];
+  sections.push("# Superpowers Workflow");
+  sections.push("");
+  sections.push("The following Superpowers skills are relevant to this task.");
 
-  sections.push(`# 🦸 Superpowers Workflow`);
-  sections.push(``);
-  sections.push(`You have access to the following Superpowers skills:`);
-  sections.push(``);
-
-  for (const name of skillNames) {
-    const skill = skills.get(name);
-    if (!skill) continue;
-
-    sections.push(`## ${skill.name}`);
-    if (skill.description) {
-      sections.push(`*${skill.description}*`);
+  if (mode === "summary") {
+    sections.push("Load a full skill with the `superpowers_skill` tool before applying it.");
+    sections.push("");
+    for (const name of skillNames) {
+      const skill = skills.get(name);
+      if (!skill) continue;
+      sections.push(`- **${skill.name}**${skill.description ? ` — ${skill.description}` : ""}`);
     }
-    sections.push(``);
-    sections.push(skill.content);
-    sections.push(``);
-    sections.push(`---`);
-    sections.push(``);
+  } else {
+    for (const name of skillNames) {
+      const skill = skills.get(name);
+      if (!skill) continue;
+      sections.push("");
+      sections.push(`## ${skill.name}`);
+      if (skill.description) sections.push(`*${skill.description}*`);
+      sections.push("");
+      sections.push(skill.content);
+      sections.push("");
+      sections.push("---");
+    }
   }
 
-  // Add OpenClaw-specific tool mapping
-  sections.push(`## Tool Mapping (Superpowers → OpenClaw)`);
-  sections.push(``);
-  sections.push(`| Superpowers | OpenClaw |`);
-  sections.push(`|-------------|----------|`);
-  sections.push(`| TodoWrite | Task tracking via notes |`);
-  sections.push(`| Task / subagent dispatch | \`sessions_spawn\` with \`runtime: "subagent"\` |`);
-  sections.push(`| Bash | \`exec\` tool |`);
-  sections.push(`| Read | \`read\` tool |`);
-  sections.push(`| Edit | \`edit\` tool |`);
-  sections.push(`| Write | \`write\` tool |`);
-  sections.push(`| Skill | Use \`skill\` tool (this plugin provides it) |`);
-  sections.push(``);
-  sections.push(`---`);
-  sections.push(``);
-  sections.push(`**Remember**: Follow the skills exactly. They are mandatory workflows, not suggestions.`);
+  sections.push("");
+  sections.push(TOOL_MAPPING);
 
-  return sections.join("\n");
+  let out = sections.join("\n");
+
+  if (maxChars > 0 && out.length > maxChars) {
+    out =
+      out.slice(0, maxChars).trimEnd() +
+      "\n\n_[Superpowers Bridge: context truncated to maxInjectedChars. Use the `superpowers_skill` tool to load any skill in full.]_";
+  }
+
+  return out;
 }
+
+// ---------------------------------------------------------------------------
+// Plugin entry
+// ---------------------------------------------------------------------------
 
 const superpowersBridgePlugin = {
   id: "superpowers-bridge",
   name: "Superpowers Bridge",
-  description: "Bridge to Superpowers workflow skills - auto-fetches from GitHub",
-  kind: "extension" as const,
+  description: "Bridge to Superpowers workflow skills - auto-fetches from GitHub and injects relevant skills",
 
-  register(api: OpenClawPluginApi) {
+  register(api: any) {
     const config = (api.pluginConfig || {}) as PluginConfig;
+    const logger: Logger = api.logger ?? console;
 
     if (config.enabled === false) {
-      api.logger.info("[Superpowers Bridge] Plugin disabled");
+      logger.info("[Superpowers Bridge] Plugin disabled via config");
       return;
     }
 
     const repoUrl = config.skillsRepo || DEFAULT_SKILLS_REPO;
     const autoDetect = config.autoDetectCode !== false;
+    const injectionMode: "summary" | "full" =
+      config.injectionMode === "full" ? "full" : "summary";
+    const maxInjectedChars =
+      typeof config.maxInjectedChars === "number" ? config.maxInjectedChars : 3600;
+    const injectOncePerSession = config.injectOncePerSession !== false;
+    const defaultSkill = config.defaultSkill || "using-superpowers";
 
-    // Ensure skills are available
-    const { success, skillsDir, message } = ensureSkills(repoUrl, api.logger);
-    
+    const keywords: Record<string, string[]> = { ...DEFAULT_KEYWORDS };
+    if (config.extraKeywords) {
+      for (const [skillName, kws] of Object.entries(config.extraKeywords)) {
+        keywords[skillName] = [...(keywords[skillName] ?? []), ...kws];
+      }
+    }
+
+    // Fetch + load
+    const { success, skillsDir, message } = ensureSkills(repoUrl, logger);
     if (!success) {
-      api.logger.error(`[Superpowers Bridge] Failed to initialize: ${message}`);
-      // Continue anyway - might work on next start or user can fix network
+      logger.error(`[Superpowers Bridge] Failed to initialize: ${message}`);
     }
 
-    // Load all skills
-    const skills = loadSkills(skillsDir, api.logger);
-    api.logger.info(`[Superpowers Bridge] Loaded ${skills.size} skills`);
-
+    const skills = loadSkills(skillsDir, logger);
+    logger.info(`[Superpowers Bridge] Loaded ${skills.size} skills from ${skillsDir}`);
     if (skills.size === 0 && success) {
-      api.logger.warn(`[Superpowers Bridge] No skills found in ${skillsDir}`);
+      logger.warn(`[Superpowers Bridge] No skills found in ${skillsDir}`);
     }
 
-    // Inject relevant skills on agent start
-    api.on("before_agent_start", (event, ctx) => {
-      if (skills.size === 0) {
-        return {};
+    if (config.autoUpdate) {
+      const r = updateSkills(logger);
+      logger.info(`[Superpowers Bridge] autoUpdate: ${r.message}`);
+      if (r.success) {
+        const reloaded = loadSkills(skillsDir, logger);
+        skills.clear();
+        for (const [n, s] of reloaded) skills.set(n, s);
       }
+    }
 
-      const prompt = event.prompt || "";
+    // Per-session de-dup to avoid re-injecting the same skill every turn.
+    const injectedBySession = new Map<string, Set<string>>();
+    const MAX_TRACKED_SESSIONS = 500;
 
-      // Detect relevant skills
-      const relevantSkills = autoDetect
-        ? detectRelevantSkills(prompt, skills)
-        : ALWAYS_LOAD_SKILLS.filter(name => skills.has(name));
+    api.on("before_prompt_build", (event: any, ctx: any) => {
+      if (skills.size === 0) return {};
 
-      if (relevantSkills.length === 0) {
-        return {};
+      const prompt: string = event?.prompt || "";
+      if (!prompt.trim()) return {};
+
+      const relevant = autoDetect
+        ? detectRelevantSkills(prompt, skills, keywords, config.autoSelectSkills, defaultSkill)
+        : [defaultSkill].filter((n) => skills.has(n));
+
+      if (relevant.length === 0) return {};
+
+      const sessionKey: string = ctx?.sessionKey || ctx?.sessionId || "default";
+      if (injectOncePerSession) {
+        let seen = injectedBySession.get(sessionKey);
+        if (!seen) {
+          seen = new Set();
+          injectedBySession.set(sessionKey, seen);
+          if (injectedBySession.size > MAX_TRACKED_SESSIONS) {
+            const first = injectedBySession.keys().next().value;
+            if (first !== undefined) injectedBySession.delete(first);
+          }
+        }
+        const fresh = relevant.filter((n) => !seen.has(n));
+        if (fresh.length === 0) return {};
+        fresh.forEach((n) => seen.add(n));
+        return {
+          prependContext: buildSkillsContext(skills, fresh, injectionMode, maxInjectedChars),
+        };
       }
-
-      const guidance = buildSkillsContext(skills, relevantSkills);
 
       return {
-        appendSystemContext: guidance,
+        prependContext: buildSkillsContext(skills, relevant, injectionMode, maxInjectedChars),
       };
     });
 
-    // Register skill tool
-    const skillTool: Tool = {
-      name: "skill",
-      description: "Load and apply a Superpowers skill by name. Use this when a specific skill applies to your task.",
+    // Tool: load a skill explicitly
+    api.registerTool({
+      name: "superpowers_skill",
+      label: "Superpowers Skill",
+      description:
+        "Load the full text of a Superpowers workflow skill by name. Use when a Superpowers skill is relevant to the task.",
       parameters: {
         type: "object",
         properties: {
           name: {
             type: "string",
-            description: "Name of the skill to load",
+            description: "Name of the skill to load, e.g. brainstorming, test-driven-development",
           },
         },
         required: ["name"],
       },
-      async execute(args: { name: string }) {
-        const skill = skills.get(args.name);
+      async execute(_toolCallId: string, params: any) {
+        const name = String(params?.name ?? "").trim();
+        const skill = skills.get(name);
         if (!skill) {
-          const available = Array.from(skills.keys()).join(", ");
+          const available = Array.from(skills.keys()).sort().join(", ");
           return {
-            error: `Skill '${args.name}' not found. Available: ${available}`,
+            content: [{ type: "text", text: `Skill '${name}' not found. Available: ${available}` }],
+            details: { found: false, available: Array.from(skills.keys()) },
           };
         }
-
         return {
-          content: skill.content,
-          name: skill.name,
-          description: skill.description,
+          content: [{ type: "text", text: skill.content }],
+          details: { found: true, name: skill.name, description: skill.description },
         };
       },
-    };
+    });
 
-    api.registerTool(skillTool);
-
-    // Register update_skills tool
-    const updateSkillsTool: Tool = {
+    // Tool: update skills
+    api.registerTool({
       name: "update_superpowers_skills",
-      description: "Update Superpowers skills to the latest version from GitHub (git pull)",
-      parameters: {
-        type: "object",
-        properties: {},
-      },
+      label: "Update Superpowers Skills",
+      description: "Pull the latest Superpowers skills from GitHub (git pull) and reload them.",
+      parameters: { type: "object", properties: {} },
       async execute() {
-        const result = updateSkills(api.logger);
+        const result = updateSkills(logger);
         if (result.success) {
-          // Reload skills after update
-          const newSkills = loadSkills(skillsDir, api.logger);
+          const reloaded = loadSkills(skillsDir, logger);
           skills.clear();
-          for (const [name, skill] of newSkills) {
-            skills.set(name, skill);
-          }
-          api.logger.info(`[Superpowers Bridge] Reloaded ${skills.size} skills after update`);
+          for (const [n, s] of reloaded) skills.set(n, s);
+          logger.info(`[Superpowers Bridge] Reloaded ${skills.size} skills after update`);
         }
-        return result;
+        return {
+          content: [{ type: "text", text: result.message }],
+          details: result,
+        };
       },
-    };
+    });
 
-    api.registerTool(updateSkillsTool);
-
-    // Register version check tool
-    const versionTool: Tool = {
+    // Tool: version
+    api.registerTool({
       name: "superpowers_version",
-      description: "Check the current version of Superpowers skills",
-      parameters: {
-        type: "object",
-        properties: {},
-      },
+      label: "Superpowers Version",
+      description: "Report the currently loaded Superpowers skills version (git commit + date).",
+      parameters: { type: "object", properties: {} },
       async execute() {
-        return getSkillsVersion(api.logger);
+        const result = getSkillsVersion(logger);
+        return {
+          content: [{ type: "text", text: result.message }],
+          details: { ...result, loadedSkills: skills.size },
+        };
       },
-    };
+    });
 
-    api.registerTool(versionTool);
-
-    api.logger.info("[Superpowers Bridge] Plugin registered with tools: skill, update_superpowers_skills, superpowers_version");
+    logger.info(
+      "[Superpowers Bridge] Registered tools: superpowers_skill, update_superpowers_skills, superpowers_version",
+    );
   },
 };
 

@@ -1,35 +1,68 @@
 {
   "id": "superpowers-bridge",
   "name": "Superpowers Bridge",
-  "description": "Bridge to Superpowers workflow skills - auto-fetches from GitHub",
-  "version": "2.1.0",
-  "kind": "extension",
+  "description": "Bridge to Superpowers workflow skills - auto-fetches from GitHub and injects relevant skills into the agent prompt",
+  "version": "2.2.0",
+  "contracts": {
+    "tools": ["superpowers_skill", "update_superpowers_skills", "superpowers_version"]
+  },
+  "activation": {
+    "onStartup": true
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
     "properties": {
       "enabled": {
         "type": "boolean",
-        "default": true
+        "default": true,
+        "description": "Enable/disable the plugin"
       },
       "skillsRepo": {
         "type": "string",
         "default": "https://github.com/obra/superpowers.git",
-        "description": "GitHub repository URL for Superpowers skills"
-      },
-      "docsPath": {
-        "type": "string",
-        "default": "docs/superpowers"
+        "description": "Git repository URL for Superpowers skills"
       },
       "autoDetectCode": {
         "type": "boolean",
         "default": true,
-        "description": "Auto-detect code tasks and load relevant skills"
+        "description": "Auto-detect code tasks and inject relevant skills"
       },
       "autoUpdate": {
         "type": "boolean",
         "default": false,
-        "description": "Auto-update skills on plugin start (not recommended)"
+        "description": "Run git pull on plugin start (not recommended)"
+      },
+      "injectionMode": {
+        "type": "string",
+        "enum": ["summary", "full"],
+        "default": "summary",
+        "description": "summary = skill names + descriptions only; full = inject full skill bodies"
+      },
+      "maxInjectedChars": {
+        "type": "number",
+        "default": 3600,
+        "description": "Hard cap on injected context size (0 = unlimited)"
+      },
+      "injectOncePerSession": {
+        "type": "boolean",
+        "default": true,
+        "description": "Inject each skill at most once per session"
+      },
+      "defaultSkill": {
+        "type": "string",
+        "default": "using-superpowers",
+        "description": "Skill always marked as relevant"
+      },
+      "autoSelectSkills": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional whitelist of skill names eligible for auto-selection"
+      },
+      "extraKeywords": {
+        "type": "object",
+        "additionalProperties": { "type": "array", "items": { "type": "string" } },
+        "description": "Extra trigger keywords per skill name, merged with built-ins"
       }
     }
   }
